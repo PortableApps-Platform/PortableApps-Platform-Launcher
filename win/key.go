@@ -1,0 +1,223 @@
+package registry
+
+import (
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/portapps/portapps/v3/pkg/proc"
+	"golang.org/x/sys/windows/registry"
+)
+
+// Key the registry key structure
+type Key struct {
+	Key     string
+	Arch    string
+	Default string
+}
+
+const (
+	backupTimestampFormat = "20060102150405"
+	maxBackup             = 19
+)
+
+// Add add a registry key
+func (k *Key) Add(force bool) error {
+	args := []string{"add", k.Key, fmt.Sprintf("/reg:%s", k.Arch)}
+	if k.Default != "" {
+		args = append(args, "/d", k.Default)
+	}
+	if force {
+		args = append(args, "/f")
+	}
+
+	cmdResult, err := proc.Cmd(proc.CmdOptions{
+		Command:    "reg",
+		Args:       args,
+		HideWindow: true,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot add registry key '%s': %w", k.Key, err)
+	}
+
+	if cmdResult.ExitCode != 0 {
+		if len(cmdResult.Stderr) > 0 {
+			return fmt.Errorf("%s, exit code %d", cmdResult.Stderr, cmdResult.ExitCode)
+		}
+		return fmt.Errorf("exit code %d", cmdResult.ExitCode)
+	}
+
+	return nil
+}
+
+// Delete removes a registry key
+func (k *Key) Delete(force bool) error {
+	args := []string{"delete", k.Key, fmt.Sprintf("/reg:%s", k.Arch)}
+	if force {
+		args = append(args, "/f")
+	}
+
+	cmdResult, err := proc.Cmd(proc.CmdOptions{
+		Command:    "reg",
+		Args:       args,
+		HideWindow: true,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot remove registry key '%s': %w", k.Key, err)
+	}
+
+	if cmdResult.ExitCode != 0 {
+		if len(cmdResult.Stderr) > 0 {
+			return fmt.Errorf("%s, exit code %d", cmdResult.Stderr, cmdResult.ExitCode)
+		}
+		return fmt.Errorf("exit code %d", cmdResult.ExitCode)
+	}
+
+	return nil
+}
+
+// Exists checks if a registry key exists
+func (k *Key) Exists() bool {
+	args := []string{"query", k.Key, fmt.Sprintf("/reg:%s", k.Arch)}
+
+	cmdResult, err := proc.Cmd(proc.CmdOptions{
+		Command:    "reg",
+		Args:       args,
+		HideWindow: true,
+	})
+
+	return err == nil && cmdResult.ExitCode == 0
+}
+
+// Export exports a registry key
+func (k *Key) Export(file string) error {
+	if !k.Exists() {
+		return nil
+	}
+
+	cmdResult, err := proc.Cmd(proc.CmdOptions{
+		Command:    "reg",
+		Args:       []string{"export", k.Key, file, "/y", fmt.Sprintf("/reg:%s", k.Arch)},
+		HideWindow: true,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot export registry key '%s': %w", k.Key, err)
+	}
+
+	if cmdResult.ExitCode != 0 {
+		if len(cmdResult.Stderr) > 0 {
+			return fmt.Errorf("%s, exit code %d", cmdResult.Stderr, cmdResult.ExitCode)
+		}
+		return fmt.Errorf("exit code %d", cmdResult.ExitCode)
+	}
+
+	return nil
+}
+
+// Import imports a registry key
+func (k *Key) Import(file string) error {
+	// Save current reg key
+	if err := k.Export(fmt.Sprintf("%s.%s", file, time.Now().Format(backupTimestampFormat))); err != nil {
+		return err
+	}
+	if err := pruneRegistryBackups(file); err != nil {
+		return fmt.Errorf("cannot prune registry backups: %w", err)
+	}
+
+	// Check if reg file exists
+	if _, err := os.Stat(file); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("reg file %s not found", file)
+		}
+		return fmt.Errorf("cannot stat reg file %s: %w", file, err)
+	}
+
+	// Import
+	cmdResult, err := proc.Cmd(proc.CmdOptions{
+		Command:    "reg",
+		Args:       []string{"import", file, fmt.Sprintf("/reg:%s", k.Arch)},
+		HideWindow: true,
+	})
+	if err != nil {
+		return fmt.Errorf("cannot import registry key '%s': %w", k.Key, err)
+	}
+
+	if cmdResult.ExitCode != 0 {
+		if len(cmdResult.Stderr) > 0 {
+			return fmt.Errorf("%s, exit code %d", cmdResult.Stderr, cmdResult.ExitCode)
+		}
+		return fmt.Errorf("exit code %d", cmdResult.ExitCode)
+	}
+
+	return nil
+}
+
+// Open opens a registry key
+func (k *Key) Open() (registry.Key, error) {
+	regSpl := strings.SplitN(k.Key, `\`, 2)
+	if len(regSpl) != 2 || regSpl[1] == "" {
+		return registry.NONE, fmt.Errorf("registry key %q must include a hive and path", k.Key)
+	}
+
+	var regKey registry.Key
+	switch regSpl[0] {
+	case "HKCR":
+		regKey = registry.CLASSES_ROOT
+	case "HKCU":
+		regKey = registry.CURRENT_USER
+	case "HKLM":
+		regKey = registry.LOCAL_MACHINE
+	case "HKU":
+		regKey = registry.USERS
+	case "HKCC":
+		regKey = registry.CURRENT_CONFIG
+	default:
+		return registry.NONE, fmt.Errorf("unknown hive %s", regSpl[0])
+	}
+
+	return registry.OpenKey(regKey, regSpl[1], registry.ALL_ACCESS)
+}
+
+func pruneRegistryBackups(file string) error {
+	dir := filepath.Dir(file)
+	backupPrefix := filepath.Base(file) + "."
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+
+	var backups []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasPrefix(entry.Name(), backupPrefix) {
+			continue
+		}
+		if !isRegistryBackup(entry.Name(), backupPrefix) {
+			continue
+		}
+		backups = append(backups, filepath.Join(dir, entry.Name()))
+	}
+
+	sort.Strings(backups)
+	for len(backups) > maxBackup {
+		if err := os.Remove(backups[0]); err != nil {
+			return err
+		}
+		backups = backups[1:]
+	}
+
+	return nil
+}
+
+func isRegistryBackup(name string, prefix string) bool {
+	timestamp := strings.TrimPrefix(name, prefix)
+	if len(timestamp) != len(backupTimestampFormat) {
+		return false
+	}
+	_, err := time.Parse(backupTimestampFormat, timestamp)
+	return err == nil
+}
